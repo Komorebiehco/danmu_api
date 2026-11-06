@@ -1,44 +1,65 @@
 name: Fork Sync
 
-permissions:
-    contents: write
-
 on:
-    schedule:
-        - cron: "0 0 * * *"  # 每天午夜执行
-    workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: "0 0 * * *" # 00:00 UTC / 北京时间 08:00
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-sync-main
+  cancel-in-progress: false
 
 jobs:
-    sync_with_upstream:
-        name: Sync with Upstream
-        runs-on: ubuntu-latest
-        if: ${{ github.event.repository.fork }}
+  sync_with_upstream:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ github.event.repository.fork }}
+    env:
+      UPSTREAM_REPOSITORY: huangxd-/danmu_api
+      UPSTREAM_BRANCH: main
+      TARGET_BRANCH: main
 
-        steps:
-            - name: Checkout target repo
-              uses: actions/checkout@v5
-              with:
-                token: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check sync credential
+        env:
+          SYNC_KEY: ${{ secrets.FORK_SYNC_SSH_KEY }}
+        run: |
+          if [ -z "$SYNC_KEY" ]; then
+            echo "::error::Set FORK_SYNC_SSH_KEY to a write-enabled deploy key for this repository."
+            exit 1
+          fi
 
-            - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.3
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: huangxd-/danmu_api
-                  upstream_sync_branch: main
-                  target_sync_branch: main
-                  test_mode: false
+      - name: Checkout target repo
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot push upstream changes to workflow files.
+          # This deploy key is scoped to this repository only.
+          ssh-key: ${{ secrets.FORK_SYNC_SSH_KEY }}
 
-            - name: Check for new commits
-              if: success()
-              run: echo "Sync completed successfully"
+      - name: Merge and push upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
 
-            - name: Check for Failure
-              if: failure()
-              run: |
-                  echo "[Error] Sync failed. This might be due to:"
-                  echo "1. Changes in the upstream workflow file"
-                  echo "2. Merge conflicts that need manual resolution"
-                  echo "3. Network issues"
-                  echo "Please check the logs and consider manual sync if needed."
-                  exit 1
+          if git merge-base --is-ancestor "$upstream_ref" HEAD; then
+            echo "Already up to date with ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          before="$(git rev-parse HEAD)"
+          git merge --no-edit --no-stat "$upstream_ref"
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          after="$(git rev-parse HEAD)"
+          echo "Synced ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH}: ${before} -> ${after}" >> "$GITHUB_STEP_SUMMARY"
